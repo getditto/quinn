@@ -1,57 +1,58 @@
 use std::{
     future::Future,
-    io,
     pin::Pin,
-    sync::Arc,
-    task::{Context, Poll, ready},
+    task::{Context, Poll},
     time::Instant,
 };
+use std::{io, sync::Arc, task::ready};
 
-use tokio::{
-    io::Interest,
-    time::{Sleep, sleep_until},
-};
+use async_io::Async;
+use async_io::Timer;
 
-use super::{AsyncTimer, AsyncUdpSocket, Runtime, UdpSenderHelper, UdpSenderHelperSocket};
+use super::AsyncTimer;
+use super::{AsyncUdpSocket, Runtime, UdpSender, UdpSenderHelper, UdpSenderHelperSocket};
 
-/// A Quinn runtime for Tokio
+/// A Quinn runtime for smol
 #[derive(Debug)]
-pub struct TokioRuntime;
+pub struct SmolRuntime;
 
-impl Runtime for TokioRuntime {
+impl Runtime for SmolRuntime {
     fn new_timer(&self, t: Instant) -> Pin<Box<dyn AsyncTimer>> {
-        Box::pin(sleep_until(t.into()))
+        Box::pin(Timer::at(t))
     }
 
     fn spawn(&self, future: Pin<Box<dyn Future<Output = ()> + Send>>) {
-        tokio::spawn(future);
+        ::smol::spawn(future).detach();
     }
 
     fn wrap_udp_socket(&self, sock: std::net::UdpSocket) -> io::Result<Box<dyn AsyncUdpSocket>> {
-        Ok(Box::new(UdpSocket {
-            inner: Arc::new(udp::UdpSocketState::new((&sock).into())?),
-            io: Arc::new(tokio::net::UdpSocket::from_std(sock)?),
-        }))
-    }
-
-    fn now(&self) -> Instant {
-        tokio::time::Instant::now().into_std()
+        Ok(Box::new(UdpSocket::new(sock)?))
     }
 }
 
-impl AsyncTimer for Sleep {
-    fn reset(self: Pin<&mut Self>, t: Instant) {
-        Self::reset(self, t.into())
+impl AsyncTimer for Timer {
+    fn reset(mut self: Pin<&mut Self>, t: Instant) {
+        self.set_at(t)
     }
+
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-        Future::poll(self, cx)
+        Future::poll(self, cx).map(|_| ())
     }
 }
 
 #[derive(Debug, Clone)]
 struct UdpSocket {
-    io: Arc<tokio::net::UdpSocket>,
+    io: Arc<Async<std::net::UdpSocket>>,
     inner: Arc<udp::UdpSocketState>,
+}
+
+impl UdpSocket {
+    fn new(sock: std::net::UdpSocket) -> io::Result<Self> {
+        Ok(Self {
+            inner: Arc::new(udp::UdpSocketState::new((&sock).into())?),
+            io: Arc::new(Async::new_nonblocking(sock)?),
+        })
+    }
 }
 
 impl UdpSenderHelperSocket for UdpSocket {
@@ -60,14 +61,12 @@ impl UdpSenderHelperSocket for UdpSocket {
     }
 
     fn try_send(&self, transmit: &udp::Transmit<'_>) -> io::Result<()> {
-        self.io.try_io(Interest::WRITABLE, || {
-            self.inner.send((&self.io).into(), transmit)
-        })
+        self.inner.send((&self.io).into(), transmit)
     }
 }
 
 impl AsyncUdpSocket for UdpSocket {
-    fn create_sender(&self) -> Pin<Box<dyn super::UdpSender>> {
+    fn create_sender(&self) -> Pin<Box<dyn UdpSender>> {
         Box::pin(UdpSenderHelper::new(self.clone(), |socket: &Self| {
             let socket = socket.clone();
             async move { socket.io.writable().await }
@@ -77,21 +76,19 @@ impl AsyncUdpSocket for UdpSocket {
     fn poll_recv(
         &mut self,
         cx: &mut Context<'_>,
-        bufs: &mut [std::io::IoSliceMut<'_>],
+        bufs: &mut [io::IoSliceMut<'_>],
         meta: &mut [udp::RecvMeta],
     ) -> Poll<io::Result<usize>> {
         loop {
-            ready!(self.io.poll_recv_ready(cx))?;
-            if let Ok(res) = self.io.try_io(Interest::READABLE, || {
-                self.inner.recv((&self.io).into(), bufs, meta)
-            }) {
+            ready!(self.io.poll_readable(cx))?;
+            if let Ok(res) = self.inner.recv((&self.io).into(), bufs, meta) {
                 return Poll::Ready(Ok(res));
             }
         }
     }
 
     fn local_addr(&self) -> io::Result<std::net::SocketAddr> {
-        self.io.local_addr()
+        self.io.as_ref().as_ref().local_addr()
     }
 
     fn may_fragment(&self) -> bool {

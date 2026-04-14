@@ -46,19 +46,29 @@ impl SendStream {
         }
     }
 
-    /// Write bytes to the stream
+    /// Write a buffer into this stream, returning how many bytes were written
     ///
-    /// Yields the number of bytes written on success. Congestion and flow control may cause this to
-    /// be shorter than `buf.len()`, indicating that only a prefix of `buf` was written.
+    /// Unless this method errors, it waits until some amount of `buf` can be written into this
+    /// stream, and then writes as much as it can without waiting again. Due to congestion and flow
+    /// control, this may be shorter than `buf.len()`. On success this yields the length of the
+    /// prefix that was written.
     ///
-    /// This operation is cancel-safe.
+    /// # Cancel safety
+    ///
+    /// This method is cancellation safe. If this does not resolve, no bytes were written.
     pub async fn write(&mut self, buf: &[u8]) -> Result<usize, WriteError> {
         poll_fn(|cx| self.execute_poll(cx, |s| s.write(buf))).await
     }
 
-    /// Convenience method to write an entire buffer to the stream
+    /// Write a buffer into this stream in its entirety
     ///
-    /// This operation is *not* cancel-safe.
+    /// This method repeatedly calls [`write`](Self::write) until all bytes are written, or an
+    /// error occurs.
+    ///
+    /// # Cancel safety
+    ///
+    /// This method is *not* cancellation safe. Even if this does not resolve, some prefix of `buf`
+    /// may have been written when previously polled.
     pub async fn write_all(&mut self, mut buf: &[u8]) -> Result<(), WriteError> {
         while !buf.is_empty() {
             let written = self.write(buf).await?;
@@ -67,28 +77,55 @@ impl SendStream {
         Ok(())
     }
 
-    /// Write chunks to the stream
+    /// Write a slice of [`Bytes`] into this stream, returning how much was written
     ///
-    /// Yields the number of bytes and chunks written on success.
-    /// Congestion and flow control may cause this to be shorter than `buf.len()`,
-    /// indicating that only a prefix of `bufs` was written
+    /// Bytes to try to write are provided to this method as an array of cheaply cloneable chunks.
+    /// Unless this method errors, it waits until some amount of those bytes can be written into
+    /// this stream, and then writes as much as it can without waiting again. Due to congestion and
+    /// flow control, this may be less than the total number of bytes.
     ///
-    /// This operation is cancel-safe.
+    /// On success, this method both mutates `bufs` and yields an informative [`Written`] struct
+    /// indicating how much was written:
+    ///
+    /// - [`Bytes`] chunks that were fully written are mutated to be [empty](Bytes::is_empty).
+    /// - If a [`Bytes`] chunk was partially written, it is [split to](Bytes::split_to) contain
+    ///   only the suffix of bytes that were not written.
+    /// - The yielded [`Written`] struct indicates how many chunks were fully written as well as
+    ///   how many bytes were written.
+    ///
+    /// # Cancel safety
+    ///
+    /// This method is cancellation safe. If this does not resolve, no bytes were written.
     pub async fn write_chunks(&mut self, bufs: &mut [Bytes]) -> Result<Written, WriteError> {
         poll_fn(|cx| self.execute_poll(cx, |s| s.write_chunks(bufs))).await
     }
 
-    /// Convenience method to write a single chunk in its entirety to the stream
+    /// Write a single [`Bytes`] into this stream in its entirety
     ///
-    /// This operation is *not* cancel-safe.
+    /// Bytes to write are provided to this method as an single cheaply cloneable chunk. This
+    /// method repeatedly calls [`write_chunks`](Self::write_chunks) until all bytes are written,
+    /// or an error occurs.
+    ///
+    /// # Cancel safety
+    ///
+    /// This method is *not* cancellation safe. Even if this does not resolve, some bytes may have
+    /// been written when previously polled.
     pub async fn write_chunk(&mut self, buf: Bytes) -> Result<(), WriteError> {
         self.write_all_chunks(&mut [buf]).await?;
         Ok(())
     }
 
-    /// Convenience method to write an entire list of chunks to the stream
+    /// Write a slice of [`Bytes`] into this stream in its entirety
     ///
-    /// This operation is *not* cancel-safe.
+    /// Bytes to write are provided to this method as an array of cheaply cloneable chunks. This
+    /// method repeatedly calls [`write_chunks`](Self::write_chunks) until all bytes are written,
+    /// or an error occurs. This method mutates `bufs` by mutating all chunks to be
+    /// [empty](Bytes::is_empty).
+    ///
+    /// # Cancel safety
+    ///
+    /// This method is *not* cancellation safe. Even if this does not resolve, some bytes may have
+    /// been written when previously polled.
     pub async fn write_all_chunks(&mut self, mut bufs: &mut [Bytes]) -> Result<(), WriteError> {
         while !bufs.is_empty() {
             let written = self.write_chunks(bufs).await?;
@@ -97,9 +134,13 @@ impl SendStream {
         Ok(())
     }
 
-    fn execute_poll<F, R>(&mut self, cx: &mut Context, write_fn: F) -> Poll<Result<R, WriteError>>
+    fn execute_poll<F, R>(
+        &mut self,
+        cx: &mut Context<'_>,
+        write_fn: F,
+    ) -> Poll<Result<R, WriteError>>
     where
-        F: FnOnce(&mut proto::SendStream) -> Result<R, proto::WriteError>,
+        F: FnOnce(&mut proto::SendStream<'_>) -> Result<R, proto::WriteError>,
     {
         use proto::WriteError::*;
         let mut conn = self.conn.state.lock("SendStream::poll_write");
@@ -245,7 +286,7 @@ impl SendStream {
     /// stream becomes writable or is closed.
     pub fn poll_write(
         self: Pin<&mut Self>,
-        cx: &mut Context,
+        cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<Result<usize, WriteError>> {
         pin!(self.get_mut().write(buf)).as_mut().poll(cx)
@@ -273,15 +314,19 @@ fn send_stream_stopped(
 
 #[cfg(feature = "futures-io")]
 impl futures_io::AsyncWrite for SendStream {
-    fn poll_write(self: Pin<&mut Self>, cx: &mut Context, buf: &[u8]) -> Poll<io::Result<usize>> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
         self.poll_write(cx, buf).map_err(Into::into)
     }
 
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context) -> Poll<io::Result<()>> {
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Poll::Ready(Ok(()))
     }
 
-    fn poll_close(self: Pin<&mut Self>, _cx: &mut Context) -> Poll<io::Result<()>> {
+    fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Poll::Ready(self.get_mut().finish().map_err(Into::into))
     }
 }
@@ -295,11 +340,11 @@ impl tokio::io::AsyncWrite for SendStream {
         self.poll_write(cx, buf).map_err(Into::into)
     }
 
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context) -> Poll<io::Result<()>> {
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Poll::Ready(Ok(()))
     }
 
-    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context) -> Poll<io::Result<()>> {
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Poll::Ready(self.get_mut().finish().map_err(Into::into))
     }
 }

@@ -177,14 +177,14 @@ pub struct Opt {
     pub max_streams: usize,
     /// Number of bytes to transmit from server to client
     ///
-    /// This can use SI prefixes for sizes. E.g. 1M will transfer 1MiB, 10G
-    /// will transfer 10GiB.
+    /// This can use SI suffixes for sizes. For example, 1M will transfer
+    /// 1MiB, 10G will transfer 10GiB.
     #[clap(long, default_value = "1G", value_parser = parse_byte_size)]
     pub download_size: u64,
     /// Number of bytes to transmit from client to server
     ///
-    /// This can use SI prefixes for sizes. E.g. 1M will transfer 1MiB, 10G
-    /// will transfer 10GiB.
+    /// This can use SI suffixes for sizes. For example, 1M will transfer
+    /// 1MiB, 10G will transfer 10GiB.
     #[clap(long, default_value = "0", value_parser = parse_byte_size)]
     pub upload_size: u64,
     /// Show connection stats the at the end of the benchmark
@@ -214,15 +214,12 @@ fn parse_byte_size(s: &str) -> Result<u64, ParseIntError> {
         _ => 1,
     };
 
-    let s = if multiplier != 1 {
-        &s[..s.len() - 1]
-    } else {
-        s
+    let s = match multiplier {
+        1 => s,
+        _ => &s[..s.len() - 1],
     };
 
-    let base: u64 = u64::from_str(s)?;
-
-    Ok(base * multiplier)
+    Ok(u64::from_str(s)? * multiplier)
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -236,9 +233,9 @@ impl CipherSuite {
     pub fn as_rustls(self) -> rustls::SupportedCipherSuite {
         use rustls::crypto::ring::cipher_suite;
         match self {
-            CipherSuite::Aes128 => cipher_suite::TLS13_AES_128_GCM_SHA256,
-            CipherSuite::Aes256 => cipher_suite::TLS13_AES_256_GCM_SHA384,
-            CipherSuite::Chacha20 => cipher_suite::TLS13_CHACHA20_POLY1305_SHA256,
+            Self::Aes128 => cipher_suite::TLS13_AES_128_GCM_SHA256,
+            Self::Aes256 => cipher_suite::TLS13_AES_256_GCM_SHA384,
+            Self::Chacha20 => cipher_suite::TLS13_CHACHA20_POLY1305_SHA256,
         }
     }
 }
@@ -248,9 +245,9 @@ impl FromStr for CipherSuite {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
-            "aes128" => Ok(CipherSuite::Aes128),
-            "aes256" => Ok(CipherSuite::Aes256),
-            "chacha20" => Ok(CipherSuite::Chacha20),
+            "aes128" => Ok(Self::Aes128),
+            "aes256" => Ok(Self::Aes256),
+            "chacha20" => Ok(Self::Chacha20),
             _ => Err(anyhow::anyhow!("Unknown cipher suite {}", s)),
         }
     }

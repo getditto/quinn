@@ -39,6 +39,9 @@ pub(super) struct PacketSpace {
     /// Transmitted but not acked
     // We use a BTreeMap here so we can efficiently query by range on ACK and for loss detection
     pub(super) sent_packets: BTreeMap<u64, SentPacket>,
+    /// Packets that were deemed lost
+    // Older packets are regularly removed in `Connection::drain_lost_packets`.
+    pub(super) lost_packets: BTreeMap<u64, LostPacket>,
     /// Number of explicit congestion notification codepoints seen on incoming packets
     pub(super) ecn_counters: frame::EcnCounts,
     /// Recent ECN counters sent by the peer in ACK frames
@@ -84,6 +87,7 @@ impl PacketSpace {
             largest_ack_eliciting_sent: 0,
             unacked_non_ack_eliciting_tail: 0,
             sent_packets: BTreeMap::new(),
+            lost_packets: BTreeMap::new(),
             ecn_counters: frame::EcnCounts::ZERO,
             ecn_feedback: frame::EcnCounts::ZERO,
 
@@ -302,12 +306,20 @@ pub(super) struct SentPacket {
     pub(super) stream_frames: frame::StreamMetaVec,
 }
 
+/// Represents one or more packets that are deemed lost.
+#[derive(Debug)]
+pub(super) struct LostPacket {
+    /// The time the packet was sent.
+    pub(super) time_sent: Instant,
+}
+
 /// Retransmittable data queue
 #[allow(unreachable_pub)] // fuzzing only
 #[derive(Debug, Default, Clone)]
 pub struct Retransmits {
     pub(super) max_data: bool,
     pub(super) max_stream_id: [bool; 2],
+    pub(super) streams_blocked: [bool; 2],
     pub(super) reset_stream: Vec<(StreamId, VarInt)>,
     pub(super) stop_sending: Vec<frame::StopSending>,
     pub(super) max_stream_data: FxHashSet<StreamId>,
@@ -339,6 +351,7 @@ impl Retransmits {
     pub(super) fn is_empty(&self, streams: &StreamsState) -> bool {
         !self.max_data
             && !self.max_stream_id.into_iter().any(|x| x)
+            && !self.streams_blocked.into_iter().any(|x| x)
             && self.reset_stream.is_empty()
             && self.stop_sending.is_empty()
             && self
@@ -361,6 +374,7 @@ impl ::std::ops::BitOrAssign for Retransmits {
         self.max_data |= rhs.max_data;
         for dir in Dir::iter() {
             self.max_stream_id[dir as usize] |= rhs.max_stream_id[dir as usize];
+            self.streams_blocked[dir as usize] |= rhs.streams_blocked[dir as usize];
         }
         self.reset_stream.extend_from_slice(&rhs.reset_stream);
         self.stop_sending.extend_from_slice(&rhs.stop_sending);
@@ -656,7 +670,7 @@ impl PendingAcks {
     /// Returns the delay since the packet with the largest packet number was received
     pub(super) fn ack_delay(&self, now: Instant) -> Duration {
         self.largest_packet
-            .map_or(Duration::default(), |(_, received)| now - received)
+            .map_or_else(Duration::default, |(_, received)| now - received)
     }
 
     /// Handle receipt of a new packet
@@ -761,7 +775,7 @@ impl PendingAcks {
     pub(super) fn insert_one(&mut self, packet: u64, now: Instant) {
         self.ranges.insert_one(packet);
 
-        if self.largest_packet.map_or(true, |(pn, _)| packet > pn) {
+        if self.largest_packet.is_none_or(|(pn, _)| packet > pn) {
             self.largest_packet = Some((packet, now));
         }
 

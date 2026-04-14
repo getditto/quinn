@@ -7,12 +7,11 @@ use std::{
     net::{Ipv6Addr, SocketAddr, UdpSocket},
     ops::RangeFrom,
     str,
-    sync::{Arc, Mutex},
+    sync::{Arc, LazyLock, Mutex},
 };
 
 use assert_matches::assert_matches;
 use bytes::BytesMut;
-use lazy_static::lazy_static;
 use rustls::{
     KeyLogFile,
     client::WebPkiServerVerifier,
@@ -54,13 +53,8 @@ impl Pair {
     }
 
     pub(super) fn new(endpoint_config: Arc<EndpointConfig>, server_config: ServerConfig) -> Self {
-        let server = Endpoint::new(
-            endpoint_config.clone(),
-            Some(Arc::new(server_config)),
-            true,
-            None,
-        );
-        let client = Endpoint::new(endpoint_config, None, true, None);
+        let server = Endpoint::new(endpoint_config.clone(), Some(Arc::new(server_config)), true);
+        let client = Endpoint::new(endpoint_config, None, true);
 
         Self::new_from_endpoint(client, server)
     }
@@ -233,7 +227,15 @@ impl Pair {
         );
         assert_matches!(
             self.server_conn_mut(server_ch).poll(),
+            Some(Event::HandshakeConfirmed)
+        );
+        assert_matches!(
+            self.server_conn_mut(server_ch).poll(),
             Some(Event::Connected)
+        );
+        assert_matches!(
+            self.client_conn_mut(client_ch).poll(),
+            Some(Event::HandshakeConfirmed)
         );
     }
 
@@ -676,9 +678,8 @@ const MAX_DATAGRAMS: usize = 10;
 
 fn split_transmit(transmit: Transmit, buffer: &[u8]) -> Vec<(Transmit, Bytes)> {
     let mut buffer = Bytes::copy_from_slice(buffer);
-    let segment_size = match transmit.segment_size {
-        Some(segment_size) => segment_size,
-        _ => return vec![(transmit, buffer)],
+    let Some(segment_size) = transmit.segment_size else {
+        return vec![(transmit, buffer)];
     };
 
     let mut transmits = Vec::new();
@@ -719,12 +720,11 @@ fn set_congestion_experienced(
     })
 }
 
-lazy_static! {
-    pub static ref SERVER_PORTS: Mutex<RangeFrom<u16>> = Mutex::new(4433..);
-    pub static ref CLIENT_PORTS: Mutex<RangeFrom<u16>> = Mutex::new(44433..);
-    pub(crate) static ref CERTIFIED_KEY: rcgen::CertifiedKey<rcgen::KeyPair> =
-        rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
-}
+static SERVER_PORTS: LazyLock<Mutex<RangeFrom<u16>>> = LazyLock::new(|| Mutex::new(4433..));
+pub(crate) static CLIENT_PORTS: LazyLock<Mutex<RangeFrom<u16>>> =
+    LazyLock::new(|| Mutex::new(44433..));
+pub(crate) static CERTIFIED_KEY: LazyLock<rcgen::CertifiedKey<rcgen::KeyPair>> =
+    LazyLock::new(|| rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap());
 
 #[derive(Default)]
 struct SimpleTokenLog(Mutex<HashSet<u128>>);

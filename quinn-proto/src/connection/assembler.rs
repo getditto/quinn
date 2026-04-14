@@ -314,8 +314,9 @@ impl PartialEq for Buffer {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 enum State {
+    #[default]
     Ordered,
     Unordered {
         /// The set of offsets that have been received from the peer, including portions not yet
@@ -330,15 +331,9 @@ impl State {
     }
 }
 
-impl Default for State {
-    fn default() -> Self {
-        Self::Ordered
-    }
-}
-
 /// Error indicating that an ordered read was performed on a stream after an unordered read
 #[derive(Debug)]
-pub struct IllegalOrderedRead;
+pub(crate) struct IllegalOrderedRead;
 
 #[cfg(test)]
 mod test {
