@@ -22,6 +22,7 @@ use crate::{
     cid_queue::CidQueue,
     coding::BufMutExt,
     config::{ServerConfig, TransportConfig},
+    connection::spaces::LostPacket,
     crypto::{self, KeyPair, Keys, PacketKey},
     frame::{self, Close, Datagram, FrameStruct, NewConnectionId, NewToken},
     packet::{
@@ -262,7 +263,7 @@ impl Connection {
         let connection_side = ConnectionSide::from(side_args);
         let side = connection_side.side();
         let initial_space = PacketSpace {
-            crypto: Some(crypto.initial_keys(&init_cid, side)),
+            crypto: Some(crypto.initial_keys(init_cid, side)),
             ..PacketSpace::new(now)
         };
         let state = State::Handshake(state::Handshake {
@@ -1145,11 +1146,7 @@ impl Connection {
                     self.spaces[SpaceId::Data].pending.new_cids.push(frame);
                 });
                 // Update Timer::PushNewCid
-                if self
-                    .timers
-                    .get(Timer::PushNewCid)
-                    .map_or(true, |x| x <= now)
-                {
+                if self.timers.get(Timer::PushNewCid).is_none_or(|x| x <= now) {
                     self.reset_cid_retirement();
                 }
             }
@@ -1297,13 +1294,6 @@ impl Connection {
         self.update_keys(None, false);
     }
 
-    // Compatibility wrapper for quinn < 0.11.7. Remove for 0.12.
-    #[doc(hidden)]
-    #[deprecated]
-    pub fn initiate_key_update(&mut self) {
-        self.force_key_update();
-    }
-
     /// Get a session reference
     pub fn crypto_session(&self) -> &dyn crypto::Session {
         &*self.crypto
@@ -1312,7 +1302,9 @@ impl Connection {
     /// Whether the connection is in the process of being established
     ///
     /// If this returns `false`, the connection may be either established or closed, signaled by the
-    /// emission of a `Connected` or `ConnectionLost` message respectively.
+    /// emission of a [`Connected`](Event::Connected) or [`ConnectionLost`](Event::ConnectionLost)
+    /// event respectively. Note that locally-initiated closes via [`close()`](Self::close) do not
+    /// emit a `ConnectionLost` event.
     pub fn is_handshaking(&self) -> bool {
         self.state.is_handshake()
     }
@@ -1323,7 +1315,10 @@ impl Connection {
     /// either peer application intentionally closes it, or when either transport layer detects an
     /// error such as a time-out or certificate validation failure.
     ///
-    /// A `ConnectionLost` event is emitted with details when the connection becomes closed.
+    /// A [`ConnectionLost`](Event::ConnectionLost) event is emitted with details when the
+    /// connection is closed by the peer or due to an error. When the local application closes
+    /// the connection via [`close()`](Self::close), no `ConnectionLost` event is emitted;
+    /// instead, pending operations fail with [`ConnectionError::LocallyClosed`].
     pub fn is_closed(&self) -> bool {
         self.state.is_closed()
     }
@@ -1421,6 +1416,11 @@ impl Connection {
         self.streams.max_concurrent(dir)
     }
 
+    /// See [`TransportConfig::send_window()`]
+    pub fn set_send_window(&mut self, send_window: u64) {
+        self.streams.set_send_window(send_window);
+    }
+
     /// See [`TransportConfig::receive_window()`]
     pub fn set_receive_window(&mut self, receive_window: VarInt) {
         if self.streams.set_receive_window(receive_window) {
@@ -1439,10 +1439,7 @@ impl Connection {
         }
         let new_largest = {
             let space = &mut self.spaces[space];
-            if space
-                .largest_acked_packet
-                .map_or(true, |pn| ack.largest > pn)
-            {
+            if space.largest_acked_packet.is_none_or(|pn| ack.largest > pn) {
                 space.largest_acked_packet = Some(ack.largest);
                 if let Some(info) = space.sent_packets.get(&ack.largest) {
                     // This should always succeed, but a misbehaving peer might ACK a packet we
@@ -1455,6 +1452,11 @@ impl Connection {
                 false
             }
         };
+
+        if self.detect_spurious_loss(&ack, space) {
+            self.stats.path.spurious_congestion_events += 1;
+            self.path.congestion.on_spurious_congestion_event();
+        }
 
         // Avoid DoS from unreasonably huge ack ranges by filtering out just the new acks.
         let mut newly_acked = ArrayRangeSet::new();
@@ -1513,7 +1515,7 @@ impl Connection {
                     Duration::from_micros(ack.delay << self.peer_params.ack_delay_exponent.0),
                 )
             };
-            let rtt = instant_saturating_sub(now, self.spaces[space].largest_acked_packet_sent);
+            let rtt = now.saturating_duration_since(self.spaces[space].largest_acked_packet_sent);
             self.path.rtt.update(ack_delay, rtt);
             if self.path.first_packet_after_rtt_sample.is_none() {
                 self.path.first_packet_after_rtt_sample =
@@ -1550,6 +1552,43 @@ impl Connection {
         Ok(())
     }
 
+    fn detect_spurious_loss(&mut self, ack: &frame::Ack, space: SpaceId) -> bool {
+        let lost_packets = &mut self.spaces[space].lost_packets;
+
+        if lost_packets.is_empty() {
+            return false;
+        }
+
+        for range in ack.iter() {
+            let spurious_losses: Vec<u64> = lost_packets
+                .range(range.clone())
+                .map(|(pn, _info)| pn)
+                .copied()
+                .collect();
+
+            for pn in spurious_losses {
+                lost_packets.remove(&pn);
+            }
+        }
+
+        // If this ACK frame acknowledged all deemed lost packets,
+        // then we have raised a spurious congestion event in the past.
+        // We cannot conclude when there are remaining packets,
+        // but future ACK frames might indicate a spurious loss detection.
+        lost_packets.is_empty()
+    }
+
+    /// Drain lost packets that we reasonably think will never arrive
+    ///
+    /// The current criterion is copied from `msquic`:
+    /// discard packets that were sent earlier than 2 probe timeouts ago.
+    fn drain_lost_packets(&mut self, now: Instant, space: SpaceId) {
+        let two_pto = 2 * self.path.rtt.pto_base();
+
+        let lost_packets = &mut self.spaces[space].lost_packets;
+        lost_packets.retain(|_pn, info| now.saturating_duration_since(info.time_sent) <= two_pto);
+    }
+
     /// Process a new ECN block from an in-order ACK
     fn process_ecn(
         &mut self,
@@ -1572,7 +1611,7 @@ impl Connection {
                 self.stats.path.congestion_events += 1;
                 self.path
                     .congestion
-                    .on_congestion_event(now, largest_sent_time, false, 0);
+                    .on_congestion_event(now, largest_sent_time, false, true, 0);
             }
         }
     }
@@ -1629,12 +1668,9 @@ impl Connection {
             return;
         }
 
-        let (_, space) = match self.pto_time_and_space(now) {
-            Some(x) => x,
-            None => {
-                error!("PTO expired while unset");
-                return;
-            }
+        let Some((_, space)) = self.pto_time_and_space(now) else {
+            error!("PTO expired while unset");
+            return;
         };
         trace!(
             in_flight = self.path.in_flight.bytes,
@@ -1665,8 +1701,6 @@ impl Connection {
         let rtt = self.path.rtt.conservative();
         let loss_delay = cmp::max(rtt.mul_f32(self.config.time_threshold), TIMER_GRANULARITY);
 
-        // Packets sent before this time are deemed lost.
-        let lost_send_time = now.checked_sub(loss_delay).unwrap();
         let largest_acked_packet = self.spaces[pn_space].largest_acked_packet.unwrap();
         let packet_threshold = self.config.packet_threshold as u64;
         let mut size_of_lost_packets = 0u64;
@@ -1674,8 +1708,9 @@ impl Connection {
         // InPersistentCongestion: Determine if all packets in the time period before the newest
         // lost packet, including the edges, are marked lost. PTO computation must always
         // include max ACK delay, i.e. operate as if in Data space (see RFC9001 §7.6.1).
-        let congestion_period =
-            self.pto(SpaceId::Data) * self.config.persistent_congestion_threshold;
+        let congestion_period = self
+            .pto(SpaceId::Data)
+            .saturating_mul(self.config.persistent_congestion_threshold);
         let mut persistent_congestion_start: Option<Instant> = None;
         let mut prev_packet = None;
         let mut in_persistent_congestion = false;
@@ -1689,8 +1724,11 @@ impl Connection {
                 persistent_congestion_start = None;
             }
 
-            if info.time_sent <= lost_send_time || largest_acked_packet >= packet + packet_threshold
-            {
+            // Packets sent before now - loss_delay are deemed lost.
+            // However, we avoid this subtraction as it can panic and there's no
+            // saturating equivalent of this substraction operation with a Duration.
+            let packet_too_old = now.saturating_duration_since(info.time_sent) >= loss_delay;
+            if packet_too_old || largest_acked_packet >= packet + packet_threshold {
                 if Some(packet) == in_flight_mtu_probe {
                     // Lost MTU probes are not included in `lost_packets`, because they should not
                     // trigger a congestion control response
@@ -1730,6 +1768,8 @@ impl Connection {
             prev_packet = Some(packet);
         }
 
+        self.drain_lost_packets(now, pn_space);
+
         // OnPacketsLost
         if let Some(largest_lost) = lost_packets.last().cloned() {
             let old_bytes_in_flight = self.path.in_flight.bytes;
@@ -1746,17 +1786,25 @@ impl Connection {
                 self.config.qlog_sink.emit_packet_lost(
                     packet,
                     &info,
-                    lost_send_time,
+                    loss_delay,
                     pn_space,
                     now,
                     self.orig_rem_cid,
                 );
+
                 self.remove_in_flight(&info);
                 for frame in info.stream_frames {
                     self.streams.retransmit(frame);
                 }
                 self.spaces[pn_space].pending |= info.retransmits;
                 self.path.mtud.on_non_probe_lost(packet, info.size);
+
+                self.spaces[pn_space].lost_packets.insert(
+                    packet,
+                    LostPacket {
+                        time_sent: info.time_sent,
+                    },
+                );
             }
 
             if self.path.mtud.black_hole_detected(now) {
@@ -1765,7 +1813,12 @@ impl Connection {
                     .congestion
                     .on_mtu_update(self.path.mtud.current_mtu());
                 if let Some(max_datagram_size) = self.datagrams().max_size() {
-                    self.datagrams.drop_oversized(max_datagram_size);
+                    if self.datagrams.drop_oversized(max_datagram_size)
+                        && self.datagrams.send_blocked
+                    {
+                        self.datagrams.send_blocked = false;
+                        self.events.push_back(Event::DatagramsUnblocked);
+                    }
                 }
             }
 
@@ -1778,6 +1831,7 @@ impl Connection {
                     now,
                     largest_lost_sent,
                     in_persistent_congestion,
+                    false,
                     size_of_lost_packets,
                 );
             }
@@ -1824,12 +1878,12 @@ impl Connection {
                 // Include max_ack_delay and backoff for ApplicationData.
                 duration += self.ack_frequency.max_ack_delay_for_pto() * backoff;
             }
-            let last_ack_eliciting = match self.spaces[space].time_of_last_ack_eliciting_packet {
-                Some(time) => time,
-                None => continue,
+            let Some(last_ack_eliciting) = self.spaces[space].time_of_last_ack_eliciting_packet
+            else {
+                continue;
             };
             let pto = last_ack_eliciting + duration;
-            if result.map_or(true, |(earliest_pto, _)| pto < earliest_pto) {
+            if result.is_none_or(|(earliest_pto, _)| pto < earliest_pto) {
                 result = Some((pto, space));
             }
         }
@@ -1918,9 +1972,8 @@ impl Connection {
             }
         }
 
-        let packet = match packet {
-            Some(x) => x,
-            None => return,
+        let Some(packet) = packet else {
+            return;
         };
         if self.side.is_server() {
             if self.spaces[SpaceId::Initial].crypto.is_some() && space_id == SpaceId::Handshake {
@@ -1950,9 +2003,8 @@ impl Connection {
     }
 
     fn reset_idle_timeout(&mut self, now: Instant, space: SpaceId) {
-        let timeout = match self.idle_timeout {
-            None => return,
-            Some(dur) => dur,
+        let Some(timeout) = self.idle_timeout else {
+            return;
         };
         if self.state.is_closed() {
             self.timers.stop(Timer::Idle);
@@ -2027,9 +2079,8 @@ impl Connection {
     }
 
     fn init_0rtt(&mut self) {
-        let (header, packet) = match self.crypto.early_crypto() {
-            Some(x) => x,
-            None => return,
+        let Some((header, packet)) = self.crypto.early_crypto() else {
+            return;
         };
         if self.side.is_client() {
             match self.crypto.transport_parameters() {
@@ -2450,7 +2501,7 @@ impl Connection {
                 if self.total_authed_packets > 1
                             || packet.payload.len() <= 16 // token + 16 byte tag
                             || !self.crypto.is_valid_retry(
-                                &self.rem_cids.active(),
+                                self.rem_cids.active(),
                                 &packet.header_data,
                                 &packet.payload,
                             )
@@ -2479,7 +2530,7 @@ impl Connection {
 
                 self.discard_space(now, SpaceId::Initial); // Make sure we clean up after any retransmitted Initials
                 self.spaces[SpaceId::Initial] = PacketSpace {
-                    crypto: Some(self.crypto.initial_keys(&rem_cid, self.side.side())),
+                    crypto: Some(self.crypto.initial_keys(rem_cid, self.side.side())),
                     next_packet_number: self.spaces[SpaceId::Initial].next_packet_number,
                     crypto_offset: client_hello.len() as u64,
                     ..PacketSpace::new(now)
@@ -2538,14 +2589,12 @@ impl Connection {
 
                 if self.side.is_client() {
                     // Client-only because server params were set from the client's Initial
-                    let params =
-                        self.crypto
-                            .transport_parameters()?
-                            .ok_or_else(|| TransportError {
-                                code: TransportErrorCode::crypto(0x6d),
-                                frame: None,
-                                reason: "transport parameters missing".into(),
-                            })?;
+                    let params = self.crypto.transport_parameters()?.ok_or_else(|| {
+                        TransportError::new(
+                            TransportErrorCode::crypto(0x6d),
+                            "transport parameters missing".to_owned(),
+                        )
+                    })?;
 
                     if self.has_0rtt() {
                         if !self.crypto.early_data_accepted().unwrap() {
@@ -2578,6 +2627,8 @@ impl Connection {
                     // Server-only
                     self.spaces[SpaceId::Data].pending.handshake_done = true;
                     self.discard_space(now, SpaceId::Handshake);
+                    self.events.push_back(Event::HandshakeConfirmed);
+                    trace!("handshake confirmed");
                 }
 
                 self.events.push_back(Event::Connected);
@@ -2611,14 +2662,12 @@ impl Connection {
                     && starting_space == SpaceId::Initial
                     && self.highest_space != SpaceId::Initial
                 {
-                    let params =
-                        self.crypto
-                            .transport_parameters()?
-                            .ok_or_else(|| TransportError {
-                                code: TransportErrorCode::crypto(0x6d),
-                                frame: None,
-                                reason: "transport parameters missing".into(),
-                            })?;
+                    let params = self.crypto.transport_parameters()?.ok_or_else(|| {
+                        TransportError::new(
+                            TransportErrorCode::crypto(0x6d),
+                            "transport parameters missing".to_owned(),
+                        )
+                    })?;
                     self.handle_peer_params(params)?;
                     self.issue_first_cids(now);
                     self.init_0rtt();
@@ -2997,6 +3046,8 @@ impl Connection {
                     if self.spaces[SpaceId::Handshake].crypto.is_some() {
                         self.discard_space(now, SpaceId::Handshake);
                     }
+                    self.events.push_back(Event::HandshakeConfirmed);
+                    trace!("handshake confirmed");
                 }
             }
         }
@@ -3092,9 +3143,8 @@ impl Connection {
 
     /// Switch to a previously unused remote connection ID, if possible
     fn update_rem_cid(&mut self) {
-        let (reset_token, retired) = match self.rem_cids.next() {
-            Some(x) => x,
-            None => return,
+        let Some((reset_token, retired)) = self.rem_cids.next() else {
+            return;
         };
 
         // Retire the current remote CID and any CIDs we had to skip.
@@ -3241,9 +3291,8 @@ impl Connection {
 
         // CRYPTO
         while buf.len() + frame::Crypto::SIZE_BOUND < max_size && !is_0rtt {
-            let mut frame = match space.pending.crypto.pop_front() {
-                Some(x) => x,
-                None => break,
+            let Some(mut frame) = space.pending.crypto.pop_front() else {
+                break;
             };
 
             // Calculate the maximum amount of crypto data we can store in the buffer.
@@ -3293,9 +3342,8 @@ impl Connection {
 
         // NEW_CONNECTION_ID
         while buf.len() + NewConnectionId::SIZE_BOUND < max_size {
-            let issued = match space.pending.new_cids.pop() {
-                Some(x) => x,
-                None => break,
+            let Some(issued) = space.pending.new_cids.pop() else {
+                break;
             };
             trace!(
                 sequence = issued.sequence,
@@ -3315,9 +3363,8 @@ impl Connection {
 
         // RETIRE_CONNECTION_ID
         while buf.len() + frame::RETIRE_CONNECTION_ID_SIZE_BOUND < max_size {
-            let seq = match space.pending.retire_cids.pop() {
-                Some(x) => x,
-                None => break,
+            let Some(seq) = space.pending.retire_cids.pop() else {
+                break;
             };
             trace!(sequence = seq, "RETIRE_CONNECTION_ID");
             buf.write(frame::FrameType::RETIRE_CONNECTION_ID);
@@ -3495,9 +3542,8 @@ impl Connection {
             self.next_crypto.as_ref(),
         )?;
 
-        let result = match result {
-            Some(r) => r,
-            None => return Ok(None),
+        let Some(result) = result else {
+            return Ok(None);
         };
 
         if result.outgoing_key_update_acked {
@@ -3561,13 +3607,13 @@ impl Connection {
     /// Decodes a packet, returning its decrypted payload, so it can be inspected in tests
     #[cfg(test)]
     pub(crate) fn decode_packet(&self, event: &ConnectionEvent) -> Option<Vec<u8>> {
-        let (first_decode, remaining) = match &event.0 {
-            ConnectionEventInner::Datagram(DatagramConnectionEvent {
-                first_decode,
-                remaining,
-                ..
-            }) => (first_decode, remaining),
-            _ => return None,
+        let ConnectionEventInner::Datagram(DatagramConnectionEvent {
+            first_decode,
+            remaining,
+            ..
+        }) = &event.0
+        else {
+            return None;
         };
 
         if remaining.is_some() {
@@ -3619,7 +3665,7 @@ impl Connection {
             .filter(|&&t| !matches!(t, Timer::KeepAlive | Timer::PushNewCid | Timer::KeyDiscard))
             .filter_map(|&t| Some((t, self.timers.get(t)?)))
             .min_by_key(|&(_, time)| time)
-            .map_or(true, |(timer, _)| timer == Timer::Idle)
+            .is_none_or(|(timer, _)| timer == Timer::Idle)
     }
 
     /// Whether explicit congestion notification is in use on outgoing packets.
@@ -3753,7 +3799,7 @@ impl Connection {
 }
 
 impl fmt::Debug for Connection {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Connection")
             .field("handshake_cid", &self.handshake_cid)
             .finish()
@@ -3951,7 +3997,7 @@ impl State {
 mod state {
     use super::*;
 
-    #[allow(unreachable_pub)] // fuzzing only
+    #[allow(unnameable_types, unreachable_pub)] // fuzzing only
     #[derive(Clone)]
     pub struct Handshake {
         /// Whether the remote CID has been set by the peer yet
@@ -3968,7 +4014,7 @@ mod state {
         pub(super) client_hello: Option<Bytes>,
     }
 
-    #[allow(unreachable_pub)] // fuzzing only
+    #[allow(unnameable_types, unreachable_pub)] // fuzzing only
     #[derive(Clone)]
     pub struct Closed {
         pub(super) reason: Close,
@@ -3982,9 +4028,14 @@ pub enum Event {
     HandshakeDataReady,
     /// The connection was successfully established
     Connected,
+    /// The TLS handshake was confirmed
+    HandshakeConfirmed,
     /// The connection was lost
     ///
-    /// Emitted if the peer closes the connection or an error is encountered.
+    /// Emitted when the connection is closed due to an error, a timeout, or the peer closing it.
+    /// This is **not** emitted when the local application closes the connection via
+    /// [`Connection::close()`](crate::Connection::close). In that case, pending operations will
+    /// fail with [`ConnectionError::LocallyClosed`].
     ConnectionLost {
         /// Reason that the connection was closed
         reason: ConnectionError,
@@ -3995,10 +4046,6 @@ pub enum Event {
     DatagramReceived,
     /// One or more application datagrams have been sent after blocking
     DatagramsUnblocked,
-}
-
-fn instant_saturating_sub(x: Instant, y: Instant) -> Duration {
-    if x > y { x - y } else { Duration::ZERO }
 }
 
 fn get_max_ack_delay(params: &TransportParameters) -> Duration {

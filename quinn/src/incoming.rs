@@ -96,7 +96,7 @@ impl Incoming {
 
     /// The original destination CID when initiating the connection
     pub fn orig_dst_cid(&self) -> ConnectionId {
-        *self.0.as_ref().unwrap().inner.orig_dst_cid()
+        self.0.as_ref().unwrap().inner.orig_dst_cid()
     }
 }
 
@@ -134,7 +134,7 @@ pub struct IncomingFuture(Result<Connecting, ConnectionError>);
 impl Future for IncomingFuture {
     type Output = Result<Connection, ConnectionError>;
 
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         match &mut self.0 {
             Ok(ref mut connecting) => Pin::new(connecting).poll(cx),
             Err(e) => Poll::Ready(Err(e.clone())),

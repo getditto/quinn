@@ -1,6 +1,6 @@
 [package]
 name = "quinn"
-version = "0.11.8"
+version = "0.12.0"
 license.workspace = true
 repository.workspace = true
 description = "Versatile QUIC transport protocol implementation"
@@ -15,7 +15,7 @@ rust-version.workspace = true
 [features]
 # NOTE: Please keep this in sync with the feature list in `.github/workflows/codecov.yml`, see
 # comment in that file for more information.
-default = ["log", "platform-verifier", "runtime-tokio", "rustls-ring", "bloom"]
+default = ["tracing-log", "platform-verifier", "runtime-tokio", "rustls-ring", "bloom"]
 # Enables `Endpoint::client` and `Endpoint::server` conveniences
 aws-lc-rs = ["proto/aws-lc-rs"]
 aws-lc-rs-fips = ["proto/aws-lc-rs-fips"]
@@ -36,31 +36,34 @@ rustls-ring = ["dep:rustls", "ring", "proto/rustls-ring", "proto/ring"]
 # Outside wasm*-unknown-unknown targets, this enables `Endpoint::client` and `Endpoint::server` conveniences.
 ring = ["proto/ring"]
 runtime-tokio = ["tokio/time", "tokio/rt", "tokio/net"]
-runtime-async-std = ["async-io", "async-std"]
-runtime-smol = ["async-io", "smol"]
+runtime-smol = ["dep:async-io", "dep:smol"]
 
 # Configure `tracing` to log events via `log` if no `tracing` subscriber exists.
-log = ["tracing/log", "proto/log", "udp/log"]
+tracing-log = ["tracing/log", "proto/tracing-log", "udp/tracing-log"]
 # Enable rustls logging
 rustls-log = ["rustls?/logging"]
 # Enable qlog support
 qlog = ["proto/qlog"]
 
+# Internal (PRIVATE!) features used to aid testing.
+# Don't rely on these whatsoever. They may disappear at any time.
+
+__rustls-post-quantum-test =  ["rustls/prefer-post-quantum", "rustls-aws-lc-rs", "proto/__rustls-post-quantum-test"]
+
 [dependencies]
 async-io = { workspace = true, optional = true }
-async-std = { workspace = true, optional = true }
 bytes = { workspace = true }
 # Enables futures::io::{AsyncRead, AsyncWrite} support for streams
 futures-io = { workspace = true, optional = true }
 rustc-hash = { workspace = true }
 pin-project-lite = { workspace = true }
-proto = { package = "quinn-proto", path = "../quinn-proto", version = "0.11.12", default-features = false }
+proto = { package = "quinn-proto", path = "../quinn-proto", version = "0.12.0", default-features = false }
 rustls = { workspace = true, optional = true }
 smol = { workspace = true, optional = true }
 thiserror = { workspace = true }
 tracing =  { workspace = true }
 tokio = { workspace = true }
-udp = { package = "quinn-udp", path = "../quinn-udp", version = "0.5", default-features = false, features = ["tracing"] }
+udp = { package = "quinn-udp", path = "../quinn-udp", version = "0.6", default-features = false, features = ["tracing"] }
 
 [target.'cfg(not(all(target_family = "wasm", target_os = "unknown")))'.dependencies]
 socket2 = { workspace = true }
@@ -75,7 +78,6 @@ bencher = { workspace = true }
 directories-next = { workspace = true }
 rand = { workspace = true }
 rcgen = { workspace = true }
-rustls-pemfile = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "time", "macros"] }
 tracing-subscriber = { workspace = true }
@@ -84,6 +86,9 @@ url = { workspace = true }
 
 [build-dependencies]
 cfg_aliases = { workspace = true }
+
+[lints]
+workspace = true
 
 [[example]]
 name = "server"
@@ -105,6 +110,10 @@ required-features = ["rustls-ring"]
 name = "connection"
 required-features = ["rustls-ring"]
 
+[[test]]
+name = "post_quantum"
+required-features = ["__rustls-post-quantum-test"]
+
 [[bench]]
 name = "bench"
 harness = false
@@ -112,4 +121,4 @@ required-features = ["rustls-ring"]
 
 [package.metadata.docs.rs]
 # all non-default features except fips (cannot build on docs.rs environment)
-features = ["lock_tracking", "rustls-aws-lc-rs", "rustls-ring", "runtime-tokio", "runtime-async-std", "runtime-smol", "log", "rustls-log"]
+features = ["lock_tracking", "rustls-aws-lc-rs", "rustls-ring", "runtime-tokio", "runtime-smol", "tracing-log", "rustls-log"]

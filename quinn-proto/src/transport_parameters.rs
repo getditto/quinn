@@ -307,11 +307,12 @@ impl From<UnexpectedEnd> for Error {
 impl TransportParameters {
     /// Encode `TransportParameters` into buffer
     pub fn write<W: BufMut>(&self, w: &mut W) {
-        for idx in self
-            .write_order
-            .as_ref()
-            .unwrap_or(&std::array::from_fn(|i| i as u8))
-        {
+        let ids = match &self.write_order {
+            Some(order) => order,
+            None => &std::array::from_fn(|i| i as u8),
+        };
+
+        for idx in ids {
             let id = TransportParameterId::SUPPORTED[*idx as usize];
             match id {
                 TransportParameterId::ReservedTransportParameter => {
@@ -469,15 +470,13 @@ impl TransportParameters {
                     if len > 8 || params.max_datagram_frame_size.is_some() {
                         return Err(Error::Malformed);
                     }
-                    params.max_datagram_frame_size = Some(r.get().unwrap());
+                    params.max_datagram_frame_size = Some(r.get()?);
                 }
                 TransportParameterId::GreaseQuicBit => match len {
                     0 => params.grease_quic_bit = true,
                     _ => return Err(Error::Malformed),
                 },
-                TransportParameterId::MinAckDelayDraft07 => {
-                    params.min_ack_delay = Some(r.get().unwrap())
-                }
+                TransportParameterId::MinAckDelayDraft07 => params.min_ack_delay = Some(r.get()?),
                 _ => {
                     macro_rules! parse {
                         {$($(#[$doc:meta])* $name:ident ($id:ident) = $default:expr,)*} => {

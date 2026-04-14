@@ -235,21 +235,25 @@ impl Bbr {
         }
 
         if self.mode == Mode::ProbeRtt {
-            if self.exit_probe_rtt_at.is_none() {
-                // If the window has reached the appropriate size, schedule exiting
-                // ProbeRtt.  The CWND during ProbeRtt is
-                // kMinimumCongestionWindow, but we allow an extra packet since QUIC
-                // checks CWND before sending a packet.
-                if bytes_in_flight < self.get_probe_rtt_cwnd() + self.current_mtu {
-                    const K_PROBE_RTT_TIME: Duration = Duration::from_millis(200);
-                    self.exit_probe_rtt_at = Some(now + K_PROBE_RTT_TIME);
+            match self.exit_probe_rtt_at {
+                None => {
+                    // If the window has reached the appropriate size, schedule exiting
+                    // ProbeRtt.  The CWND during ProbeRtt is
+                    // kMinimumCongestionWindow, but we allow an extra packet since QUIC
+                    // checks CWND before sending a packet.
+                    if bytes_in_flight < self.get_probe_rtt_cwnd() + self.current_mtu {
+                        const K_PROBE_RTT_TIME: Duration = Duration::from_millis(200);
+                        self.exit_probe_rtt_at = Some(now + K_PROBE_RTT_TIME);
+                    }
                 }
-            } else if is_round_start && now >= self.exit_probe_rtt_at.unwrap() {
-                if !self.is_at_full_bandwidth {
-                    self.enter_startup_mode();
-                } else {
-                    self.enter_probe_bandwidth_mode(now);
+                Some(exit_time) if is_round_start && now >= exit_time => {
+                    if !self.is_at_full_bandwidth {
+                        self.enter_startup_mode();
+                    } else {
+                        self.enter_probe_bandwidth_mode(now);
+                    }
                 }
+                Some(_) => {}
             }
         }
 
@@ -465,6 +469,7 @@ impl Controller for Bbr {
         _now: Instant,
         _sent: Instant,
         _is_persistent_congestion: bool,
+        _is_ecn: bool,
         lost_bytes: u64,
     ) {
         self.loss_state.lost_bytes += lost_bytes;

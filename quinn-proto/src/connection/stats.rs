@@ -3,6 +3,8 @@
 use crate::{Dir, Duration, frame::Frame};
 
 /// Statistics about UDP datagrams transmitted or received on a connection
+///
+/// All QUIC packets are carried by UDP datagrams. Hence, these statistics cover all traffic on a connection.
 #[derive(Default, Debug, Copy, Clone)]
 #[non_exhaustive]
 pub struct UdpStats {
@@ -24,7 +26,7 @@ impl UdpStats {
     }
 }
 
-/// Number of frames transmitted of each frame type
+/// Number of frames transmitted or received of each frame type
 #[derive(Default, Copy, Clone)]
 #[non_exhaustive]
 #[allow(missing_docs)]
@@ -138,6 +140,8 @@ pub struct PathStats {
     pub cwnd: u64,
     /// Congestion events on the connection
     pub congestion_events: u64,
+    /// Spurious congestion events on the connection
+    pub spurious_congestion_events: u64,
     /// The amount of packets lost on this path
     pub lost_packets: u64,
     /// The amount of bytes lost on this path
