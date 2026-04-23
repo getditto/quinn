@@ -240,6 +240,8 @@ pub struct Connection {
     version: u32,
 }
 
+const DISABLE_SRC_IP_CHECKS: bool = true;
+
 impl Connection {
     pub(crate) fn new(
         endpoint_config: Arc<EndpointConfig>,
@@ -1421,6 +1423,11 @@ impl Connection {
         self.streams.max_concurrent(dir)
     }
 
+    /// See [`TransportConfig::send_window()`]
+    pub fn set_send_window(&mut self, send_window: u64) {
+        self.streams.set_send_window(send_window);
+    }
+
     /// See [`TransportConfig::receive_window()`]
     pub fn set_receive_window(&mut self, receive_window: VarInt) {
         if self.streams.set_receive_window(receive_window) {
@@ -2259,9 +2266,12 @@ impl Connection {
             );
         }
 
+        #[allow(clippy::collapsible_if)]
         if self.is_handshaking() && remote != self.path.remote {
-            debug!("discarding packet with unexpected remote during handshake");
-            return;
+            if !DISABLE_SRC_IP_CHECKS {
+                debug!("discarding packet with unexpected remote during handshake");
+                return;
+            }
         }
 
         let was_closed = self.state.is_closed();
@@ -3028,6 +3038,9 @@ impl Connection {
             && number == self.spaces[SpaceId::Data].rx_packet
         {
             let ConnectionSide::Server { ref server_config } = self.side else {
+                if DISABLE_SRC_IP_CHECKS {
+                    return Ok(());
+                }
                 panic!("packets from unknown remote should be dropped by clients");
             };
             debug_assert!(
@@ -3777,7 +3790,7 @@ impl ConnectionSide {
     fn remote_may_migrate(&self) -> bool {
         match self {
             Self::Server { server_config } => server_config.migration,
-            Self::Client { .. } => false,
+            Self::Client { .. } => true,
         }
     }
 
