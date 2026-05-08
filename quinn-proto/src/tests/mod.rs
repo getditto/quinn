@@ -685,10 +685,17 @@ fn test_zero_rtt_incoming_limit<F: FnOnce(&mut ServerConfig)>(configure_server: 
     const EXPECTED_DROPPED: u64 = 4;
 
     let _guard = subscribe();
+
+    let mut transport = TransportConfig::default();
+    // Assume a low-latency connection so pacing doesn't interfere with the test
+    transport.initial_rtt(Duration::from_millis(10));
+    let transport = Arc::new(transport);
+
     let mut server_config = server_config();
     configure_server(&mut server_config);
     let mut pair = Pair::new(Arc::new(EndpointConfig::default()), server_config);
-    let config = client_config();
+    let mut config = client_config();
+    config.transport_config(transport);
 
     // Establish normal connection
     let client_ch = pair.begin_connect(config.clone());
