@@ -86,7 +86,7 @@ impl QlogSink {
         &self,
         pn: u64,
         info: &SentPacket,
-        lost_send_time: Instant,
+        lost_send_time: Option<Instant>,
         space: SpaceId,
         now: Instant,
         orig_rem_cid: ConnectionId,
@@ -105,10 +105,12 @@ impl QlogSink {
                     ..Default::default()
                 }),
                 frames: None,
-                trigger: Some(match info.time_sent <= lost_send_time {
-                    true => PacketLostTrigger::TimeThreshold,
-                    false => PacketLostTrigger::ReorderingThreshold,
-                }),
+                trigger: Some(
+                    match lost_send_time.is_some_and(|lst| info.time_sent <= lst) {
+                        true => PacketLostTrigger::TimeThreshold,
+                        false => PacketLostTrigger::ReorderingThreshold,
+                    },
+                ),
             };
 
             stream.emit_event(orig_rem_cid, EventData::PacketLost(event), now);
