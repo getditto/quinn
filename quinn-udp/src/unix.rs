@@ -747,7 +747,9 @@ fn decode_recv(
             (libc::IPPROTO_IPV6, libc::IPV6_PKTINFO) => {
                 let pktinfo = unsafe { cmsg::decode::<libc::in6_pktinfo, libc::cmsghdr>(cmsg) };
                 dst_ip = Some(IpAddr::V6(Ipv6Addr::from(pktinfo.ipi6_addr.s6_addr)));
-                interface_index = Some(pktinfo.ipi6_ifindex);
+                #[allow(clippy::unnecessary_cast)] // ipi6_ifindex is u32 on Linux, i32 on Android
+                let ifindex = pktinfo.ipi6_ifindex as u32;
+                interface_index = Some(ifindex);
             }
             #[cfg(any(target_os = "linux", target_os = "android"))]
             (libc::SOL_UDP, gro::UDP_GRO) => unsafe {
