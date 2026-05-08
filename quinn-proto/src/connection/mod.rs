@@ -1672,8 +1672,9 @@ impl Connection {
         let rtt = self.path.rtt.conservative();
         let loss_delay = cmp::max(rtt.mul_f32(self.config.time_threshold), TIMER_GRANULARITY);
 
-        // Packets sent before this time are deemed lost.
-        let lost_send_time = now.checked_sub(loss_delay).unwrap();
+        // Packets sent before this time are deemed lost. May be None in environments where
+        // `Instant` starts near zero (e.g. wasm/web_time) and loss_delay > now.
+        let lost_send_time = now.checked_sub(loss_delay);
         let largest_acked_packet = self.spaces[pn_space].largest_acked_packet.unwrap();
         let packet_threshold = self.config.packet_threshold as u64;
         let mut size_of_lost_packets = 0u64;
@@ -1696,7 +1697,8 @@ impl Connection {
                 persistent_congestion_start = None;
             }
 
-            if info.time_sent <= lost_send_time || largest_acked_packet >= packet + packet_threshold
+            if lost_send_time.is_some_and(|lst| info.time_sent <= lst)
+                || largest_acked_packet >= packet + packet_threshold
             {
                 if Some(packet) == in_flight_mtu_probe {
                     // Lost MTU probes are not included in `lost_packets`, because they should not
