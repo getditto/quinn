@@ -1,0 +1,43 @@
+# Per-repo caller for non-default-branch dependency submission.
+# The reusable workflow lives in getditto/sec-tools-public.
+
+name: Dependency Submission (Release Branches)
+
+on:
+  schedule:
+    - cron: '0 6 * * 1' # Weekly Monday 06:00 UTC
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: 'Single branch to submit (leave empty for all configured branches)'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  resolve-branches:
+    runs-on: ubuntu-latest
+    outputs:
+      branches: ${{ steps.set.outputs.branches }}
+    steps:
+      - id: set
+        run: |
+          ALL='["releases/stable/sdk-4.14","releases/stable/sdk-5.0"]'
+          if [ -n "${{ inputs.branch }}" ]; then
+            echo "branches=[\"${{ inputs.branch }}\"]" >> "$GITHUB_OUTPUT"
+          else
+            echo "branches=$ALL" >> "$GITHUB_OUTPUT"
+          fi
+
+  submit-dependencies:
+    needs: resolve-branches
+    strategy:
+      fail-fast: false
+      matrix:
+        branch: ${{ fromJSON(needs.resolve-branches.outputs.branches) }}
+    uses: getditto/sec-tools-public/.github/workflows/dependency-submission.yml@main
+    with:
+      branch: ${{ matrix.branch }}
+      exclude_dirs: 'node_modules,.git,.yarn,subrepos,downstream'
