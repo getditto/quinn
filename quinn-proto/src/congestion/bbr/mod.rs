@@ -15,6 +15,19 @@ use super::{BASE_DATAGRAM_SIZE, Controller, ControllerFactory};
 mod bw_estimation;
 mod min_max;
 
+// probe: cwnd/recovery floor knob for the attachment-throughput investigation.
+// Sizes the in-flight window for the doze-inflated ACK cycle on phone Wi-Fi.
+fn probe_cwnd_floor() -> u64 {
+    static FLOOR: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *FLOOR.get_or_init(|| {
+        std::env::var("DITTO_PROBE_BBR_CWND_FLOOR_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map(|mb| mb * 1024 * 1024)
+            .unwrap_or(0)
+    })
+}
+
 /// Experimental! Use at your own risk.
 ///
 /// Aims for reduced buffer bloat and improved performance over high bandwidth-delay product networks.
@@ -57,6 +70,7 @@ pub struct Bbr {
     round_wo_bw_gain: u64,
     ack_aggregation: AckAggregationState,
     random_number_generator: rand::rngs::StdRng,
+    probe_last_log: Option<Instant>,
 }
 
 impl Bbr {
@@ -97,6 +111,7 @@ impl Bbr {
             bw_at_last_round: 0,
             round_wo_bw_gain: 0,
             ack_aggregation: AckAggregationState::default(),
+            probe_last_log: None,
             random_number_generator: rand::rngs::StdRng::from_os_rng(),
         }
     }
@@ -333,6 +348,10 @@ impl Bbr {
         if self.cwnd < self.min_cwnd {
             self.cwnd = self.min_cwnd;
         }
+        let floor = probe_cwnd_floor();
+        if floor > 0 {
+            self.cwnd = self.cwnd.max(floor);
+        }
     }
 
     fn calculate_recovery_window(&mut self, bytes_acked: u64, bytes_lost: u64, in_flight: u64) {
@@ -365,6 +384,11 @@ impl Bbr {
             .recovery_window
             .max(in_flight + bytes_acked)
             .max(self.min_cwnd);
+
+        let floor = probe_cwnd_floor();
+        if floor > 0 {
+            self.recovery_window = self.recovery_window.max(floor);
+        }
     }
 
     /// <https://datatracker.ietf.org/doc/html/draft-cardwell-iccrg-bbr-congestion-control#section-4.3.2.2>
@@ -462,6 +486,31 @@ impl Controller for Bbr {
 
         self.prev_in_flight_count = in_flight;
         self.loss_state.reset();
+
+        // probe: BBR internals visibility for the attachment-throughput
+        // investigation. Log at most once per 500ms per connection.
+        let should_log = match self.probe_last_log {
+            Some(t) => now.saturating_duration_since(t) >= Duration::from_millis(500),
+            None => true,
+        };
+        if should_log {
+            self.probe_last_log = Some(now);
+            tracing::info!(
+                target: "probe4_bbr",
+                mode = ?self.mode,
+                pacing_rate = self.pacing_rate,
+                bw_est = self.max_bandwidth.get_estimate(),
+                cwnd = self.cwnd,
+                in_flight = in_flight,
+                app_limited = app_limited,
+                min_rtt_us = self.min_rtt.as_micros() as u64,
+                max_ack_height = self.ack_aggregation.max_ack_height.get(),
+                round = self.round_count,
+                full_bw = self.is_at_full_bandwidth,
+                recovery = ?self.recovery_state,
+                "probe4 bbr internals"
+            );
+        }
     }
 
     fn on_congestion_event(
