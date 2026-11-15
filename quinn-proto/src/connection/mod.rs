@@ -237,6 +237,14 @@ pub struct Connection {
     /// probe: next histogram log instant.
     probe_rx_log_at: Option<Instant>,
 
+    /// probe: loss declarations split by trigger (time-threshold vs
+    /// packet-threshold) with age-at-declaration histogram (same ms buckets
+    /// as probe_rx_hist), logged every 2s while losses flow.
+    probe_loss_time: u64,
+    probe_loss_pkt: u64,
+    probe_loss_age_hist: [u64; 8],
+    probe_loss_log_at: Option<Instant>,
+
     streams: StreamsState,
     /// Surplus remote CIDs for future use on new paths
     rem_cids: CidQueue,
@@ -370,6 +378,10 @@ impl Connection {
             probe_rx_last: None,
             probe_rx_count: 0,
             probe_rx_log_at: None,
+            probe_loss_time: 0,
+            probe_loss_pkt: 0,
+            probe_loss_age_hist: [0; 8],
+            probe_loss_log_at: None,
             version,
         };
         if path_validated {
@@ -1712,6 +1724,42 @@ impl Connection {
 
             if info.time_sent <= lost_send_time || largest_acked_packet >= packet + packet_threshold
             {
+                // probe: classify the trigger and the packet's age at
+                // declaration, aggregated and logged every 2s.
+                {
+                    let age_us = now.saturating_duration_since(info.time_sent).as_micros() as u64;
+                    let bucket = match age_us {
+                        0..=499 => 0,
+                        500..=1_999 => 1,
+                        2_000..=7_999 => 2,
+                        8_000..=31_999 => 3,
+                        32_000..=127_999 => 4,
+                        128_000..=511_999 => 5,
+                        512_000..=2_047_999 => 6,
+                        _ => 7,
+                    };
+                    self.probe_loss_age_hist[bucket] += 1;
+                    if info.time_sent <= lost_send_time {
+                        self.probe_loss_time += 1;
+                    } else {
+                        self.probe_loss_pkt += 1;
+                    }
+                    let log_at = self.probe_loss_log_at.get_or_insert(now + Duration::from_secs(2));
+                    if now >= *log_at {
+                        tracing::info!(
+                            target: "probe4_loss",
+                            time_triggered = self.probe_loss_time,
+                            pkt_triggered = self.probe_loss_pkt,
+                            age_hist = ?self.probe_loss_age_hist,
+                            largest_acked = largest_acked_packet,
+                            "probe4 loss declarations (age ms buckets: <0.5, 0.5-2, 2-8, 8-32, 32-128, 128-512, 512-2048, >2048)"
+                        );
+                        self.probe_loss_time = 0;
+                        self.probe_loss_pkt = 0;
+                        self.probe_loss_age_hist = [0; 8];
+                        self.probe_loss_log_at = Some(now + Duration::from_secs(2));
+                    }
+                }
                 if Some(packet) == in_flight_mtu_probe {
                     // Lost MTU probes are not included in `lost_packets`, because they should not
                     // trigger a congestion control response
