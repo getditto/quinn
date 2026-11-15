@@ -227,6 +227,16 @@ pub struct Connection {
     /// no outgoing application data.
     app_limited: bool,
 
+    /// probe: inbound packet inter-arrival gap histogram (bucket bounds in
+    /// millis: <0.5, 0.5-2, 2-8, 8-32, 32-128, 128-512, 512-2048, >=2048).
+    probe_rx_hist: [u64; 8],
+    /// probe: send instant of the previous inbound packet.
+    probe_rx_last: Option<Instant>,
+    /// probe: packet count in the current histogram window.
+    probe_rx_count: u64,
+    /// probe: next histogram log instant.
+    probe_rx_log_at: Option<Instant>,
+
     streams: StreamsState,
     /// Surplus remote CIDs for future use on new paths
     rem_cids: CidQueue,
@@ -356,6 +366,10 @@ impl Connection {
             rem_cids: CidQueue::new(rem_cid),
             rng,
             stats: ConnectionStats::default(),
+            probe_rx_hist: [0; 8],
+            probe_rx_last: None,
+            probe_rx_count: 0,
+            probe_rx_log_at: None,
             version,
         };
         if path_validated {
@@ -2256,6 +2270,42 @@ impl Connection {
         stateless_reset: bool,
     ) {
         self.stats.udp_rx.ios += 1;
+
+        // probe: inbound inter-arrival gap histogram, logged every 2s while
+        // traffic is flowing (clump signature of the delivery path).
+        {
+            let count = self.probe_rx_count + 1;
+            self.probe_rx_count = count;
+            if let Some(last) = self.probe_rx_last {
+                let gap_us = now.saturating_duration_since(last).as_micros() as u64;
+                let bucket = match gap_us {
+                    0..=499 => 0,
+                    500..=1_999 => 1,
+                    2_000..=7_999 => 2,
+                    8_000..=31_999 => 3,
+                    32_000..=127_999 => 4,
+                    128_000..=511_999 => 5,
+                    512_000..=2_047_999 => 6,
+                    _ => 7,
+                };
+                self.probe_rx_hist[bucket] += 1;
+            }
+            self.probe_rx_last = Some(now);
+            let log_at = self.probe_rx_log_at.get_or_insert(now + Duration::from_secs(2));
+            if now >= *log_at {
+                if count > 20 {
+                    tracing::info!(
+                        target: "probe4_rx",
+                        gaps = ?self.probe_rx_hist,
+                        packets = count,
+                        "probe4 rx inter-arrival histogram (ms buckets: <0.5, 0.5-2, 2-8, 8-32, 32-128, 128-512, 512-2048, >2048)"
+                    );
+                }
+                self.probe_rx_hist = [0; 8];
+                self.probe_rx_count = 0;
+                self.probe_rx_log_at = Some(now + Duration::from_secs(2));
+            }
+        }
         if let Some(ref packet) = packet {
             trace!(
                 "got {:?} packet ({} bytes) from {} using id {}",
