@@ -1876,7 +1876,14 @@ impl Connection {
                 for entry in probe_ring_push.drain(..) {
                     reorder.lost_ring.push_back(entry);
                 }
-                while reorder.lost_ring.len() > spaces::ReorderTracker::RING_CAP {
+                // Evict by age, not count: spurious evidence for a declaration
+                // arrives reorder-skew + one wire RTT after it, and a count cap
+                // churns past that at high declaration rates.
+                while reorder
+                    .lost_ring
+                    .front()
+                    .map_or(false, |&(_, sent)| now.saturating_duration_since(sent) > Duration::from_secs(5))
+                {
                     reorder.lost_ring.pop_front();
                 }
             }
