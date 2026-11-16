@@ -130,6 +130,22 @@ use timer::{Timer, TimerTable};
 /// with events of the same [`Instant`] may be interleaved in any order with a
 /// call to [`handle_event`](Self::handle_event) at that same instant; however
 /// events or timeouts with different instants must not be interleaved.
+/// probe4: enable RACK-lite adaptive reorder-tolerant loss detection
+/// (NETW-2731). Replaces the static packet-count trigger with a learned
+/// reorder window; the time path, PTO, and tail behavior are unchanged.
+fn probe_rack_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("DITTO_PROBE_RACK")
+            .map(|v| v.trim() == "1" || v.trim().eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
+}
+
+/// probe4/RACK: gap above which a packet is declared lost immediately even in
+/// RACK mode (a gap this large cannot be reorder).
+const RACK_GAP_BACKSTOP: u64 = 256;
+
 pub struct Connection {
     endpoint_config: Arc<EndpointConfig>,
     config: Arc<TransportConfig>,
@@ -236,6 +252,9 @@ pub struct Connection {
     probe_rx_count: u64,
     /// probe: next histogram log instant.
     probe_rx_log_at: Option<Instant>,
+
+    /// probe: throttle state for the probe4_rack log line.
+    probe_rack_log_at: Option<Instant>,
 
     /// probe: loss declarations split by trigger (time-threshold vs
     /// packet-threshold) with age-at-declaration histogram (same ms buckets
@@ -378,6 +397,7 @@ impl Connection {
             probe_rx_last: None,
             probe_rx_count: 0,
             probe_rx_log_at: None,
+            probe_rack_log_at: None,
             probe_loss_time: 0,
             probe_loss_pkt: 0,
             probe_loss_age_hist: [0; 8],
@@ -1498,6 +1518,36 @@ impl Connection {
             }
         }
 
+        // probe4/RACK: a packet number we previously declared lost appearing in
+        // this ACK proves the declaration was spurious (the original copy did
+        // arrive). Learn the reorder window from the observed skew.
+        if probe_rack_enabled() {
+            let ring_empty = self.spaces[space].reorder.lost_ring.is_empty();
+            if !ring_empty {
+                let mut max_skew: Option<Duration> = None;
+                let mut hits = 0u64;
+                for range in ack.iter() {
+                    for &(pn, sent) in &self.spaces[space].reorder.lost_ring {
+                        if range.contains(&pn) {
+                            let skew = now.saturating_duration_since(sent);
+                            max_skew = Some(max_skew.map_or(skew, |m: Duration| m.max(skew)));
+                            hits += 1;
+                        }
+                    }
+                }
+                if let Some(skew) = max_skew {
+                    let margin = self.path.rtt.conservative();
+                    let reorder = &mut self.spaces[space].reorder;
+                    let cap = (margin * 2).max(Duration::from_millis(500));
+                    reorder.learned_wnd = reorder.learned_wnd.max(skew + margin).min(cap);
+                    reorder.spurious += hits;
+                    reorder.last_spurious = Some(now);
+                    // Resolved entries leave the ring; they cannot be spurious twice.
+                    reorder.lost_ring.retain(|&(pn, _)| !ack.iter().any(|r| r.contains(&pn)));
+                }
+            }
+        }
+
         if newly_acked.is_empty() {
             return Ok(());
         }
@@ -1704,6 +1754,17 @@ impl Connection {
         let packet_threshold = self.config.packet_threshold as u64;
         let mut size_of_lost_packets = 0u64;
 
+        // probe4/RACK: when enabled and an RTT sample exists, replace the
+        // packet-count trigger with the adaptive reorder window; keep the time
+        // path and a huge-gap backstop.
+        let use_rack =
+            probe_rack_enabled() && self.path.first_packet_after_rtt_sample.is_some();
+        let reo_wnd = if use_rack {
+            self.spaces[pn_space].reorder.window(self.path.rtt.min())
+        } else {
+            Duration::ZERO
+        };
+
         // InPersistentCongestion: Determine if all packets in the time period before the newest
         // lost packet, including the edges, are marked lost. PTO computation must always
         // include max ACK delay, i.e. operate as if in Data space (see RFC9001 §7.6.1).
@@ -1712,6 +1773,7 @@ impl Connection {
         let mut persistent_congestion_start: Option<Instant> = None;
         let mut prev_packet = None;
         let mut in_persistent_congestion = false;
+        let mut probe_ring_push: Vec<(u64, Instant)> = Vec::new();
 
         let space = &mut self.spaces[pn_space];
         space.loss_time = None;
@@ -1722,7 +1784,13 @@ impl Connection {
                 persistent_congestion_start = None;
             }
 
-            if info.time_sent <= lost_send_time || largest_acked_packet >= packet + packet_threshold
+            let gap = largest_acked_packet.saturating_sub(packet);
+            let packet_fires = !use_rack && largest_acked_packet >= packet + packet_threshold;
+            let reorder_fires = use_rack
+                && gap >= 1
+                && now.saturating_duration_since(info.time_sent) >= reo_wnd;
+            let backstop_fires = use_rack && gap >= RACK_GAP_BACKSTOP;
+            if info.time_sent <= lost_send_time || packet_fires || reorder_fires || backstop_fires
             {
                 // probe: classify the trigger and the packet's age at
                 // declaration, aggregated and logged every 2s.
@@ -1766,6 +1834,7 @@ impl Connection {
                     lost_mtu_probe = in_flight_mtu_probe;
                 } else {
                     lost_packets.push(packet);
+                    probe_ring_push.push((packet, info.time_sent));
                     size_of_lost_packets += info.size as u64;
                     if info.ack_eliciting && due_to_ack {
                         match persistent_congestion_start {
@@ -1797,6 +1866,50 @@ impl Connection {
             }
 
             prev_packet = Some(packet);
+        }
+
+        // probe4/RACK: record declarations for spurious detection, decay the
+        // learned window when quiet, and emit the throttled state log.
+        if use_rack {
+            {
+                let reorder = &mut self.spaces[pn_space].reorder;
+                for entry in probe_ring_push.drain(..) {
+                    reorder.lost_ring.push_back(entry);
+                }
+                while reorder.lost_ring.len() > spaces::ReorderTracker::RING_CAP {
+                    reorder.lost_ring.pop_front();
+                }
+            }
+            let rtt_c = self.path.rtt.conservative();
+            let reorder = &mut self.spaces[pn_space].reorder;
+            let due = reorder
+                .last_decay
+                .map_or(true, |t| now.saturating_duration_since(t) > rtt_c);
+            if due {
+                reorder.last_decay = Some(now);
+                let quiet = reorder
+                    .last_spurious
+                    .map_or(true, |t| now.saturating_duration_since(t) > 2 * rtt_c);
+                if quiet {
+                    reorder.learned_wnd = reorder.learned_wnd.mul_f32(0.875);
+                }
+            }
+        }
+        if probe_rack_enabled() {
+            let log_at = self.probe_rack_log_at.get_or_insert(now + Duration::from_secs(2));
+            if now >= *log_at {
+                let reorder = &self.spaces[pn_space].reorder;
+                tracing::info!(
+                    target: "probe4_rack",
+                    active = use_rack,
+                    reo_wnd_us = reorder.window(self.path.rtt.min()).as_micros() as u64,
+                    learned_us = reorder.learned_wnd.as_micros() as u64,
+                    spurious_total = reorder.spurious,
+                    ring = reorder.lost_ring.len(),
+                    "probe4 rack state"
+                );
+                self.probe_rack_log_at = Some(now + Duration::from_secs(2));
+            }
         }
 
         // OnPacketsLost

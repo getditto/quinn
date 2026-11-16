@@ -15,6 +15,51 @@ use crate::{
     crypto::Keys, frame, packet::SpaceId, range_set::ArrayRangeSet, shared::IssuedCid,
 };
 
+/// RACK-lite adaptive reorder tracking for probe4 (NETW-2731).
+///
+/// The stock packet-threshold rule (declare lost when 3 later packets are
+/// acked) fires on every 802.11 A-MPDU retry reorder, causing a spurious
+/// retransmission storm. This tracker replaces the count trigger with a
+/// time-based reorder window that learns the link's reorder skew from
+/// observed spurious declarations (a declared-lost packet number appearing in
+/// a later ACK proves the declaration was spurious).
+#[derive(Debug)]
+pub(super) struct ReorderTracker {
+    /// Learned reorder window component (grows on spurious declarations,
+    /// decays toward zero when none are observed).
+    pub(super) learned_wnd: Duration,
+    /// Recently declared-lost packet numbers with their send times, for
+    /// spurious detection. Bounded.
+    pub(super) lost_ring: std::collections::VecDeque<(u64, Instant)>,
+    /// Total spurious declarations observed (metric).
+    pub(super) spurious: u64,
+    /// Last decay instant.
+    pub(super) last_decay: Option<Instant>,
+    /// Last spurious detection instant.
+    pub(super) last_spurious: Option<Instant>,
+}
+
+impl ReorderTracker {
+    pub(super) const RING_CAP: usize = 128;
+
+    fn default_() -> Self {
+        Self {
+            learned_wnd: Duration::ZERO,
+            lost_ring: std::collections::VecDeque::new(),
+            spurious: 0,
+            last_decay: None,
+            last_spurious: None,
+        }
+    }
+
+    /// The effective reorder window: max(min_rtt/4, learned, timer granularity).
+    pub(super) fn window(&self, min_rtt: Duration) -> Duration {
+        (min_rtt / 4)
+            .max(self.learned_wnd)
+            .max(crate::TIMER_GRANULARITY)
+    }
+}
+
 pub(super) struct PacketSpace {
     pub(super) crypto: Option<Keys>,
     pub(super) dedup: Dedup,
@@ -60,6 +105,8 @@ pub(super) struct PacketSpace {
     /// exceeding the reordering window in time. Only set for packets numbered prior to a packet
     /// that has been acknowledged.
     pub(super) loss_time: Option<Instant>,
+    /// probe4: RACK-lite adaptive reorder tracking (see ReorderTracker).
+    pub(super) reorder: ReorderTracker,
     /// Number of tail loss probes to send
     pub(super) loss_probes: u32,
     pub(super) ping_pending: bool,
@@ -92,6 +139,7 @@ impl PacketSpace {
 
             time_of_last_ack_eliciting_packet: None,
             loss_time: None,
+            reorder: ReorderTracker::default_(),
             loss_probes: 0,
             ping_pending: false,
             immediate_ack_pending: false,
