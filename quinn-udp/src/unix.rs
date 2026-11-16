@@ -126,7 +126,16 @@ impl UdpSocketState {
         #[cfg(any(target_os = "linux", target_os = "android"))]
         {
             // opportunistically try to enable GRO. See gro::gro_segments().
-            let _ = set_socket_option(&*io, libc::SOL_UDP, gro::UDP_GRO, OPTION_ON);
+            // probe4: DITTO_PROBE_DISABLE_GRO=1 skips the enable to test whether
+            // GRO super-packet handling drops segments on the receive path.
+            let disable_gro = std::env::var("DITTO_PROBE_DISABLE_GRO")
+                .map(|v| v.trim() == "1" || v.trim().eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+            if !disable_gro {
+                let _ = set_socket_option(&*io, libc::SOL_UDP, gro::UDP_GRO, OPTION_ON);
+            } else {
+                crate::log::info!("probe4: UDP_GRO disabled by DITTO_PROBE_DISABLE_GRO");
+            }
 
             // Forbid IPv4 fragmentation. Set even for IPv6 to account for IPv6 mapped IPv4 addresses.
             // Set `may_fragment` to `true` if this option is not supported on the platform.
